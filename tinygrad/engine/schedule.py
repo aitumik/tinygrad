@@ -37,7 +37,7 @@ tensor_uop_spec = PatternMatcher([
 
   # DETACH and CONTIGUOUS change how we interpret the source UOp
   # CONTIGUOUS ensures the source UOp realizes
-  (UPat((Ops.DETACH, Ops.CONTIGUOUS), name="root", src=(UPat.var("x"),), arg=None), lambda root,x: root.dtype == x.dtype),
+  (UPat((Ops.DETACH, Ops.CONTIGUOUS, Ops.CONTIGUOUS_BACKWARD), name="root", src=(UPat.var("x"),), arg=None), lambda root,x: root.dtype == x.dtype),
 
   # COPY
   # NOTE: the arg here specifies clone=True, which prevents folding same device copy
@@ -81,10 +81,8 @@ class ScheduleContext:
   realizes: dict[UOp, UOp] = field(default_factory=dict)             # this holds all the BUFFER uops we mutate in this schedule
   allbufs: dict[UOp, UOp] = field(default_factory=dict)              # this maps BUFFER uops the actual op
   ops_metadata: dict[UOp, Metadata] = field(default_factory=dict)    # this maps fused ops to Metadata
-  contiguous: dict[UOp, UOp] = field(default_factory=dict)           # this maps roots to places they are made contiguous
   children: defaultdict[UOp, dict[UOp, None]] = field(default_factory=lambda: defaultdict(dict))
   preloads: defaultdict[Buffer, dict[UOp, None]] = field(default_factory=lambda: defaultdict(dict))
-  becomes_map: dict[UOp, UOp] = field(default_factory=dict)
 
 # wrap tensor uops around a VIEW(BUFFER, <uop>)
 # this BUFFER preserves a link back to the uop on the tensor after the scheduler rewrites it.
@@ -354,20 +352,20 @@ def simplify_reduceop(reduce:UOp, x:UOp) -> UOp|None:
     case _: return None
   return reduce.const_like(ret)
 
-def found_contiguous(ctx:ScheduleContext, contig:UOp, src:UOp):
-  if (sti:=unwrap(src.st).invert(src.base.shape)) is not None: ctx.contiguous[src.base] = contig.view(sti)
-def replace_contiguous(ctx:ScheduleContext, alu:UOp):
+def found_contiguous(ctx:dict[UOp, UOp], contig:UOp, src:UOp):
+  if (sti:=unwrap(src.st).invert(src.base.shape)) is not None: ctx[src.base] = contig.view(sti)
+def replace_contiguous(ctx:dict[UOp, UOp], alu:UOp):
   new_src = list(alu.src)
   for i,s in enumerate(alu.src):
-    if (replace_src:=ctx.contiguous.get(s, None)) is not None: new_src[i] = replace_src
+    if (replace_src:=ctx.get(s, None)) is not None: new_src[i] = replace_src
   if tuple(new_src) != alu.src: return alu.replace(src=tuple(new_src))
 
 sym = symbolic_simple+PatternMatcher([
   # UOp with size 0 is zero
   (UPat(set(Ops)-{Ops.SINK}, name="root"), lambda root: root.const_like(0) if root.base.st is not None and root.size == 0 \
     and not (root.base.op is Ops.CONST and root.base.arg == 0) else None),
-  # DETACH is a NOOP here
-  (UPat(Ops.DETACH, name="detach"), lambda detach: detach.src[0]),
+  # DETACH and CONTIGUOUS_BACKWARD are NOOPs here
+  (UPat((Ops.DETACH, Ops.CONTIGUOUS_BACKWARD), name="x"), lambda x: x.src[0]),
   # reduce of size 0 is the identity element
   (UPat(Ops.REDUCE_AXIS, name="reduce", src=(UPat.var("x"),)),
    lambda reduce,x: reduce.const_like(identity_element(reduce.arg[0], reduce.dtype)) if x.size == 0 and reduce.size != 0 else None),
@@ -473,7 +471,6 @@ def append_uop(ctx:ScheduleContext, view:UOp, buf_uop:UOp) -> None:
   if (op:=uval(view)).op is Ops.ASSIGN: ctx.assigns.add(buf_uop)
   for x in op.base.src:
     if is_scheduled(x.base): ctx.children.setdefault(x.base.buf_uop, {})[buf_uop] = None
-  buf_uop.buffer.ref(1)
 create_ctx = PatternMatcher([(UPat(Ops.VIEW, name="view", src=(UPat(Ops.BUFFER, name="buf_uop"), UPat())), append_uop)])
 
 # **** movement ops
@@ -492,17 +489,28 @@ remove_movement_ops = merge_views+PatternMatcher([
 @track_rewrites(named=True)
 def create_schedule_with_vars(big_sink:UOp, skip_check:bool=not __debug__) -> tuple[list[ScheduleItem], dict[Variable, int], dict[UOp, UOp]]:
   if not skip_check: type_verify(list(big_sink.toposort), tensor_uop_spec)
-  tensor_map = graph_rewrite_map(big_sink, remove_movement_ops+sym, ctx:=ScheduleContext())
+  tensor_map = graph_rewrite_map(big_sink, remove_movement_ops+sym, ctx={})
+  # tensors can become an existing buffer or simplify to a const, no ScheduleItem needed
+  becomes_map: dict[UOp, UOp] = {}
+  for k,v in tensor_map.items():
+    # NOOP
+    if k.base is v.base: continue
+    # NOTE: only the base tensors get a BUFFER UOp
+    if v.is_realized and k is k.base: becomes_map[k] = v.view(unwrap(k.st))
+    # otherwise if it simplified to a CONST the UOp just becomes that CONST
+    elif v.op is Ops.CONST: becomes_map[k] = v
+
+  # we group the rest of UOps into ScheduleItems
   rev_tensor_map: dict[UOp, list[UOp]] = {}
   for k,v in tensor_map.items(): rev_tensor_map.setdefault(v, []).append(k)
   # add BUFFER uops
-  sink = add_buffers(tensor_map[big_sink], rev_tensor_map, ctx, cache={})
+  sink = add_buffers(tensor_map[big_sink], rev_tensor_map, ctx:=ScheduleContext(), cache={})
   # add realizes
   sink = graph_rewrite(sink, do_realize+create_ctx, ctx)
   # group realizes into kernels
   store_groups = group_realizes(ctx)
   graph_rewrite(sink, break_sched, ctx)
-  # preschedule realize groups
+  # create schedule items + map buffers to realized tensors
   prescheduled: list[ScheduleItem] = []
   for store_uops in store_groups:
     small_sink = UOp.sink(*[ctx.realizes[u] for u in store_uops])
@@ -510,16 +518,9 @@ def create_schedule_with_vars(big_sink:UOp, skip_check:bool=not __debug__) -> tu
     prescheduled.append(schedule_uop(small_sink, ctx))
     # can only schedule once
     for buf_uop in store_uops:
-      for tensor_uop in ctx.tensor_uops[buf_uop]: ctx.becomes_map[tensor_uop] = buf_uop.view(unwrap(tensor_uop.st))
-
-  # tensors can become an existing buffer or simplify to a const, no ScheduleItem needed
-  for k,v in tensor_map.items():
-    # NOOP
-    if k.base is v.base: continue
-    # NOTE: only the base tensors get a BUFFER UOp
-    if v.is_realized and k is k.base: ctx.becomes_map[k] = v.view(unwrap(k.st))
-    # otherwise if it simplified to a CONST the UOp just becomes that CONST
-    elif v.op is Ops.CONST: ctx.becomes_map[k] = v
+      for tensor_uop in ctx.tensor_uops[buf_uop]: becomes_map[tensor_uop] = buf_uop.view(unwrap(tensor_uop.st))
+      # increment refcount for this buffer
+      buf_uop.buffer.ref(1)
 
   # add kernel children
   schedule_targets = {out:si for si in prescheduled for out in si.outputs}
@@ -548,4 +549,4 @@ def create_schedule_with_vars(big_sink:UOp, skip_check:bool=not __debug__) -> tu
   # confirm everything was scheduled correctly
   if len(schedule) != (groups:=len(prescheduled)): raise RuntimeError(f"cycle detected in graph, grouped {groups} but only scheduled {len(schedule)}")
   if DEBUG >= 1 and len(schedule) >= 10: print(f"scheduled {len(schedule)} kernels")
-  return schedule, ctx.var_vals, ctx.becomes_map
+  return schedule, ctx.var_vals, becomes_map
